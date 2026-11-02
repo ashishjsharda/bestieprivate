@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import uuid
 from datetime import datetime
 
@@ -22,7 +23,7 @@ st.set_page_config(page_title="BestiePrivate", page_icon="🫶", layout="wide")
 st.markdown(
     """
     <style>
-      .block-container {padding-top: 1.6rem;}
+      .block-container {padding-top: 3.5rem;}
       .bestie-tool {font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem;
                     padding: 2px 8px; border-radius: 6px; background: rgba(118,185,0,0.14);
                     border: 1px solid rgba(118,185,0,0.45); display: inline-block; margin: 2px 4px 2px 0;}
@@ -34,13 +35,45 @@ st.markdown(
 )
 
 
+# ----------------------------------------------------------------------------- config
+# BESTIE_HOSTED=1 -> public demo mode: each visitor gets their own memory file, and model calls
+# use the visitor's own Nebius key. BESTIE_FREE_MESSAGES lets visitors try a few messages on the
+# owner's key first (0 = bring-your-own-key only). BESTIE_FREE_GLOBAL_LIMIT caps total trial
+# messages per app run so the owner's credits can't be drained.
+HOSTED = os.getenv("BESTIE_HOSTED", "").strip().lower() in ("1", "true", "yes")
+FREE_MESSAGES = int(os.getenv("BESTIE_FREE_MESSAGES", "0") or 0)
+FREE_GLOBAL_LIMIT = int(os.getenv("BESTIE_FREE_GLOBAL_LIMIT", "200") or 0)
+OWNER_KEY = llm.api_key_present()
+TRIAL_ON = HOSTED and OWNER_KEY and FREE_MESSAGES > 0
+
+
 # ----------------------------------------------------------------------------- state
 @st.cache_resource
 def get_store() -> MemoryStore:
     return MemoryStore()
 
 
-store = get_store()
+@st.cache_resource
+def trial_counter() -> dict:
+    """Server-wide trial usage: {'total': n, visitor_id: n}. Resets when the app restarts."""
+    return {"total": 0}
+
+
+def visitor_store() -> MemoryStore:
+    """Hosted mode: one memory file per visitor, keyed by a random id kept in the URL (?u=...)."""
+    vid = st.query_params.get("u", "")
+    if not (vid.isalnum() and 8 <= len(vid) <= 32):
+        vid = uuid.uuid4().hex[:16]
+        st.query_params["u"] = vid
+    st.session_state.visitor_id = vid
+    path = os.path.join(tempfile.gettempdir(), "bestie-visitors", f"{vid}.db")
+    if st.session_state.get("store_path") != path:
+        st.session_state.store = MemoryStore(path)
+        st.session_state.store_path = path
+    return st.session_state.store
+
+
+store = visitor_store() if HOSTED else get_store()
 
 if "session_id" not in st.session_state:
     # Every app launch starts a NEW session: memories persist, the chat transcript doesn't carry over.
@@ -57,7 +90,11 @@ def new_session() -> None:
 # ----------------------------------------------------------------------------- sidebar
 with st.sidebar:
     st.markdown("## 🫶 BestiePrivate")
-    st.caption("Your private AI bestie. Memory stays on this machine.")
+    if HOSTED:
+        st.caption("Public demo. Your memory is private to your browser link and is cleared when the "
+                   "app restarts. For real privacy, run Bestie on your own machine.")
+    else:
+        st.caption("Your private AI bestie. Memory stays on this machine.")
 
     labels = list(llm.MODELS.keys())
     default_idx = next((i for i, l in enumerate(labels) if llm.MODELS[l] == llm.DEFAULT_MODEL), 0)
@@ -70,10 +107,31 @@ with st.sidebar:
     incognito = st.toggle("🕶️ Incognito (don't store this chat)", value=False,
                           help="Transcript is kept only in browser memory. Memories are saved only if you or Bestie explicitly save one.")
 
-    if llm.api_key_present():
+    user_key = st.text_input(
+        "Your Nebius API key" + (" (optional)" if OWNER_KEY and not HOSTED else ""),
+        type="password",
+        key="user_api_key",
+        placeholder="paste your key",
+        help="Get a key at tokenfactory.nebius.com → API keys. It's kept only in this browser "
+             "session for this tab: never saved to disk, to memory, or to logs.",
+    ).strip()
+
+    if user_key:
+        st.success("Using your own Nebius key", icon="🔑")
+    elif TRIAL_ON:
+        used = trial_counter().get(st.session_state.get("visitor_id", ""), 0)
+        left = max(FREE_MESSAGES - used, 0)
+        if left and trial_counter()["total"] < FREE_GLOBAL_LIMIT:
+            st.info(f"Free trial: {left} message(s) left. Add your own key above to keep going.", icon="🎁")
+        else:
+            st.warning("Free trial used up. Add your own Nebius key above to keep chatting.", icon="🔑")
+    elif HOSTED:
+        st.warning("Add your Nebius API key above to chat. Slash commands like `/remember` work without one.", icon="🔑")
+    elif OWNER_KEY:
         st.success("Nebius API key loaded", icon="🔑")
     else:
-        st.error("NEBIUS_API_KEY missing — add it to .env and restart.", icon="⚠️")
+        st.error("No API key. Paste one above, or add NEBIUS_API_KEY to .env and restart.", icon="⚠️")
+    st.caption("[Get a Nebius API key](https://tokenfactory.nebius.com)")
 
     st.divider()
     s = store.stats()
@@ -102,11 +160,34 @@ with st.sidebar:
                     st.rerun()
 
 
-def get_client():
-    try:
-        return llm.get_client()
-    except llm.MissingAPIKeyError:
+def get_client(consume_trial: bool = False):
+    """Visitor's own key first. Otherwise the owner's key: always when running locally,
+    and in hosted mode only while the visitor still has free trial messages."""
+    if user_key:
+        return llm.get_client(user_key)
+    if not OWNER_KEY:
         return None
+    if not HOSTED:
+        return llm.get_client()
+    if not TRIAL_ON:
+        return None
+    counter = trial_counter()
+    vid = st.session_state.get("visitor_id", "")
+    if counter.get(vid, 0) >= FREE_MESSAGES or counter["total"] >= FREE_GLOBAL_LIMIT:
+        return None
+    if consume_trial:
+        counter[vid] = counter.get(vid, 0) + 1
+        counter["total"] += 1
+    return llm.get_client()
+
+
+NO_KEY_MSG = (
+    "Add your Nebius API key in the sidebar to chat (free at tokenfactory.nebius.com → API keys). "
+    "Slash commands like `/remember` still work without one."
+    if HOSTED else
+    "Paste a Nebius API key in the sidebar, or set NEBIUS_API_KEY in `.env` and restart. "
+    "Slash commands like `/remember` still work offline."
+)
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -154,8 +235,9 @@ with tab_chat:
 
     if not history:
         st.markdown("### Hey bestie 👋")
+        where = ("**only for your private demo link**" if HOSTED else "**only on this computer**")
         st.markdown(
-            "I remember what you tell me — **only on this computer**. Try:\n"
+            f"I remember what you tell me — {where}. Try:\n"
             "- *“Remember my sister Priya's birthday is March 3 and she loves orchids.”*\n"
             "- *“Add a goal: finish the hackathon video by Thursday 9am.”*\n"
             "- *“Draft a text to Priya wishing her happy birthday.”*\n"
@@ -175,9 +257,10 @@ with tab_chat:
         with st.chat_message("user"):
             st.markdown(prompt)
         with st.chat_message("assistant", avatar="🫶"):
-            client = get_client()
-            if client is None and not prompt.strip().startswith("/"):
-                st.error("Set NEBIUS_API_KEY in `.env` (see README) and restart. Slash commands like `/remember` still work offline.")
+            is_slash = prompt.strip().startswith("/")
+            client = get_client(consume_trial=not is_slash)
+            if client is None and not is_slash:
+                st.error(NO_KEY_MSG)
                 st.stop()
             with st.spinner(f"Thinking with {model_id}…"):
                 try:
@@ -190,7 +273,9 @@ with tab_chat:
                     msg = str(e)
                     hint = ""
                     if "401" in msg or "auth" in msg.lower():
-                        hint = " Check that NEBIUS_API_KEY is valid."
+                        hint = " Check that your Nebius API key is valid."
+                    elif "402" in msg or "balance" in msg.lower() or "insufficient" in msg.lower():
+                        hint = " Your Nebius account may be out of credits."
                     elif "404" in msg or "not found" in msg.lower():
                         hint = " The model ID may have changed — run `python smoke_test.py` to list available models."
                     st.error(f"Model call failed: {type(e).__name__}: {msg[:300]}{hint}")
@@ -317,8 +402,13 @@ with tab_priv:
 - **Bestie can add but never delete** memories. Deletion is yours only (here, Memory tab, or `/forget <id>`).
 - **Incognito toggle** keeps a chat out of the database entirely.
 - **Slash commands** (`/remember`, `/recall`, `/goals`…) run 100% locally with no model call.
+- **Your API key** (if you paste one) lives only in this browser session. It is never written to disk, memory or logs.
 """
     )
+    if HOSTED:
+        st.info("This is a hosted demo: your memory file sits on the demo server, separate from every "
+                "other visitor, and is erased when the app restarts. The real privacy model is running "
+                "Bestie locally, where memory never leaves your machine.", icon="ℹ️")
     st.json(store.stats())
     c1, c2 = st.columns(2)
     c1.download_button(
