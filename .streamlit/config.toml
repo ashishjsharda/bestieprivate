@@ -1,0 +1,9 @@
+[browser]
+# Privacy: never send Streamlit usage statistics.
+gatherUsageStats = false
+
+[server]
+headless = true
+
+[theme]
+primaryColor = "#76B900"
