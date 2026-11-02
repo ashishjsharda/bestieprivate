@@ -57,8 +57,9 @@ def api_key_present() -> bool:
     return bool(os.getenv("NEBIUS_API_KEY", "").strip())
 
 
-def get_client() -> OpenAI:
-    key = os.getenv("NEBIUS_API_KEY", "").strip()
+def get_client(api_key: str | None = None) -> OpenAI:
+    """Build a client. `api_key` (e.g. a visitor's own key) wins over NEBIUS_API_KEY from the env."""
+    key = (api_key or "").strip() or os.getenv("NEBIUS_API_KEY", "").strip()
     if not key:
         raise MissingAPIKeyError(
             "NEBIUS_API_KEY is not set. Copy .env.example to .env and paste your key from "
